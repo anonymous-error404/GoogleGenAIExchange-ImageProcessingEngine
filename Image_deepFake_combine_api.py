@@ -7,7 +7,6 @@ from PIL import Image, ImageOps
 import torch
 import cv2
 import os
-import json
 import numpy as np
 import requests
 from io import BytesIO
@@ -21,7 +20,6 @@ import validators
 # -------------------------------
 MODEL_NAME = "prithivMLmods/deepfake-detector-model-v1"
 THRESHOLD_FAKE = 0.20
-JSON_FILE = "results.json"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 app = FastAPI(
@@ -97,27 +95,6 @@ def extract_text_from_image(image: Image.Image):
     result = reader.readtext(gray_np, detail=0)
     return "\n".join(result) if result else None
 
-def save_result_to_json(data):
-    # Create file if not exists
-    if not os.path.exists(JSON_FILE):
-        with open(JSON_FILE, "w") as f:
-            json.dump([], f, indent=4)
-
-    # Try to load previous records safely
-    try:
-        with open(JSON_FILE, "r") as f:
-            content = f.read().strip()
-            records = json.loads(content) if content else []
-    except json.JSONDecodeError:
-        records = []  # corrupted file — reset gracefully
-
-    # Append new record
-    records.append(data)
-
-    # Save updated list
-    with open(JSON_FILE, "w") as f:
-        json.dump(records, f, indent=4)
-
 
 # -------------------------------
 # API Endpoints
@@ -125,33 +102,33 @@ def save_result_to_json(data):
 class ImageURLRequest(BaseModel):
     image_url: str
 
+
 @app.get("/")
 def read_root():
-  return {"message": "Welcome to the Image Text & DeepFake Detection API. Use /analyze/url or /analyze/upload endpoints."}
+    return {"message": "Welcome to the Image Text & DeepFake Detection API. Use /analyze/url or /analyze/upload endpoints."}
+
 
 @app.post("/analyze/url")
 async def analyze_image_url(payload: ImageURLRequest):
     url = payload.image_url
-    print(url)
     if not validators.url(url):
         raise HTTPException(status_code=400, detail="Invalid image URL.")
+
     try:
         image = load_image_from_url(url)
         extracted_text = extract_text_from_image(image)
         verdict, confidence = classify_image(image)
-        record = {
+        result = {
             "timestamp": datetime.now().isoformat(),
             "image_source": url,
             "extracted_text": extracted_text if extracted_text else "No text found",
             "verdict": verdict,
             "confidence": round(confidence, 3)
         }
-        print(record)
-        save_result_to_json(record)
-        return JSONResponse(record)
+        return JSONResponse(result)
     except Exception as e:
-        print(e)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/analyze/upload")
 async def analyze_uploaded_image(file: UploadFile = File(...)):
@@ -159,22 +136,13 @@ async def analyze_uploaded_image(file: UploadFile = File(...)):
         image = Image.open(file.file).convert("RGB")
         extracted_text = extract_text_from_image(image)
         verdict, confidence = classify_image(image)
-        record = {
+        result = {
             "timestamp": datetime.now().isoformat(),
             "image_source": file.filename,
             "extracted_text": extracted_text if extracted_text else "No text found",
             "verdict": verdict,
             "confidence": round(confidence, 3)
         }
-        save_result_to_json(record)
-        return JSONResponse(record)
+        return JSONResponse(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/history")
-def get_history():
-    if not os.path.exists(JSON_FILE):
-        return []
-    with open(JSON_FILE, "r") as f:
-        data = json.load(f)
-    return JSONResponse(data)
