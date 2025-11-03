@@ -28,10 +28,10 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Allow CORS (for frontend integrations)
+# Enable CORS for all origins (adjust in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change "*" to specific frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,7 +44,7 @@ API_URL = "https://router.huggingface.co/hf-inference/models/prithivMLmods/Deep-
 THRESHOLD_FAKE = 0.20
 
 # -------------------------------
-# Load OCR Model (Only Once)
+# Load EasyOCR (once at startup)
 # -------------------------------
 print("🔤 Loading EasyOCR model (may take a few seconds)...")
 reader = easyocr.Reader(['en'], gpu=False)
@@ -80,7 +80,6 @@ def query_huggingface_api(image: Image.Image):
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Hugging Face API Error: {e}")
 
-
 def classify_image(image: Image.Image):
     """Classify image as Real or Fake based on Hugging Face output."""
     api_results = query_huggingface_api(image)
@@ -98,7 +97,6 @@ def classify_image(image: Image.Image):
     else:
         return {"verdict": "Error", "confidence": 0.0}
 
-
 def extract_text_from_image(image: Image.Image):
     """Extract visible text from image using EasyOCR."""
     gray_image = ImageOps.grayscale(image)
@@ -106,14 +104,12 @@ def extract_text_from_image(image: Image.Image):
     result = reader.readtext(gray_np, detail=0)
     return "\n".join(result) if result else None
 
-
 # -------------------------------
 # API Endpoints
 # -------------------------------
 @app.get("/")
 def root():
     return {"message": "🧠 DeepFake + OCR Detection API is running!"}
-
 
 @app.post("/analyze")
 async def analyze_image(
@@ -151,6 +147,9 @@ async def analyze_image(
     )
 
 # -------------------------------
-# Run Command
+# Cloud Run Compatible Start
 # -------------------------------
-# uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
