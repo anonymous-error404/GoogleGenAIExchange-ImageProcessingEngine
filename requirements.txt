@@ -11,12 +11,10 @@ python-dotenv==1.0.1
 
 # Image Processing (Lightweight)
 Pillow==10.4.0
+numpy==2.2.0
 
 # Optional: Validation & URL checks
 validators==0.35.0
 
-# If you use OCR or visual processing
+# OCR / Visual Text Extraction
 easyocr==1.7.2
-
-# Optional: progress bars and response parsing
-tqdm==4.67.1
