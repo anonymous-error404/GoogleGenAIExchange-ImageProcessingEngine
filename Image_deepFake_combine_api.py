@@ -1,180 +1,164 @@
-# uvicorn Image_deepFake_combine:app --reload
+# File: Image_deepFake_combine_api.py
+# Run: uvicorn Image_deepFake_combine_api:app --reload
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from PIL import Image, ImageOps
-import torch
-import cv2
-import os
-import json
 import numpy as np
-import requests
-from io import BytesIO
-from datetime import datetime
-from transformers import AutoImageProcessor, AutoModelForImageClassification
-import easyocr
+import os
 import validators
+from io import BytesIO
+import requests
+import easyocr
+from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
+import uvicorn
+
+# -------------------------------
+# Load environment variables
+# -------------------------------
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 # -------------------------------
 # CONFIG
 # -------------------------------
-MODEL_NAME = "prithivMLmods/deepfake-detector-model-v1"
+MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
 THRESHOLD_FAKE = 0.20
-JSON_FILE = "results.json"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# -------------------------------
+# Initialize FastAPI
+# -------------------------------
 app = FastAPI(
-    title="🧠 Image Text & DeepFake Detection API",
-    description="API for OCR + DeepFake analysis from image files or URLs.",
-    version="1.0.0"
+    title="🧠 Image Text & DeepFake Detector API",
+    description="API to extract text and detect DeepFake (Real vs AI-generated image).",
+    version="1.0",
 )
 
 # -------------------------------
-# Load Models Once
+# Initialize Hugging Face Client
 # -------------------------------
-print("Loading models...")
-reader = easyocr.Reader(['en'], gpu=False)
-processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-model = AutoModelForImageClassification.from_pretrained(MODEL_NAME).to(DEVICE)
-print("✅ Models loaded successfully.")
+if not HF_TOKEN:
+    raise ValueError("❌ HF_TOKEN not found in .env file!")
+
+client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
+
+# -------------------------------
+# Load EasyOCR Model
+# -------------------------------
+reader = easyocr.Reader(["en"], gpu=False)
+
 
 # -------------------------------
 # Helper Functions
 # -------------------------------
 def load_image_from_url(url: str) -> Image.Image:
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    return Image.open(BytesIO(resp.content)).convert("RGB")
+    """Load image from a given URL."""
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return Image.open(BytesIO(resp.content)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load image from URL: {str(e)}")
 
-def detect_faces_np(img_np: np.ndarray, conf_thresh: float = 0.5):
-    if not os.path.exists("deploy.prototxt") or not os.path.exists("res10_300x300_ssd_iter_140000.caffemodel"):
-        return []
-    net = cv2.dnn.readNetFromCaffe("deploy.prototxt", "res10_300x300_ssd_iter_140000.caffemodel")
-    h, w = img_np.shape[:2]
-    blob = cv2.dnn.blobFromImage(cv2.resize(img_np, (300,300)), 1.0, (300,300), (104.0,177.0,123.0))
-    net.setInput(blob)
-    detections = net.forward()
-    boxes = []
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        if confidence > conf_thresh:
-            box = detections[0,0,i,3:7] * np.array([w, h, w, h])
-            (x1, y1, x2, y2) = box.astype("int")
-            boxes.append((x1, y1, x2, y2))
-    return boxes
 
 def classify_image(img: Image.Image):
-    img_np = np.array(img)
+    """Classify image using Hugging Face DeepFake model."""
     try:
-        boxes = detect_faces_np(img_np)
-    except Exception:
-        boxes = []
+        temp_path = "temp_image.jpg"
+        img.save(temp_path, format="JPEG", quality=95)
 
-    patches = [img.crop((x1, y1, x2, y2)) for (x1, y1, x2, y2) in boxes] if boxes else [img]
-    all_results = []
+        results = client.image_classification(temp_path, model=MODEL_ID)
 
-    for patch in patches:
-        inputs = processor(images=patch, return_tensors="pt").to(DEVICE)
-        with torch.no_grad():
-            outputs = model(**inputs)
-            probs = torch.nn.functional.softmax(outputs.logits, dim=1).cpu().numpy().squeeze()
-        id2label = model.config.id2label
-        for idx, p in enumerate(probs):
-            label = id2label[str(idx)] if str(idx) in id2label else id2label[idx]
-            all_results.append((label, float(p)))
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
-    for (label, score) in all_results:
-        if "fake" in label.lower() and score > THRESHOLD_FAKE:
-            return "Fake", score
+        fake_score = 0.0
+        real_score = 0.0
+        for r in results:
+            label = r["label"].lower()
+            score = float(r["score"])
+            if "fake" in label:
+                fake_score = max(fake_score, score)
+            elif "real" in label:
+                real_score = max(real_score, score)
 
-    best_label, best_score = max(all_results, key=lambda x: x[1])
-    return ("Real", best_score) if "real" in best_label.lower() else ("Fake", best_score)
+        if fake_score > real_score and fake_score > THRESHOLD_FAKE:
+            return {"verdict": "Fake", "confidence": fake_score}
+        elif real_score >= fake_score:
+            return {"verdict": "Real", "confidence": real_score}
+        else:
+            return {"verdict": "Uncertain", "confidence": 0.0}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Hugging Face API error: {e}")
+
 
 def extract_text_from_image(image: Image.Image):
-    gray_image = ImageOps.grayscale(image)
-    gray_np = np.array(gray_image)
-    result = reader.readtext(gray_np, detail=0)
-    return "\n".join(result) if result else None
-
-def save_result_to_json(data):
-    # Create file if not exists
-    if not os.path.exists(JSON_FILE):
-        with open(JSON_FILE, "w") as f:
-            json.dump([], f, indent=4)
-
-    # Try to load previous records safely
+    """Extract text using EasyOCR."""
     try:
-        with open(JSON_FILE, "r") as f:
-            content = f.read().strip()
-            records = json.loads(content) if content else []
-    except json.JSONDecodeError:
-        records = []  # corrupted file — reset gracefully
-
-    # Append new record
-    records.append(data)
-
-    # Save updated list
-    with open(JSON_FILE, "w") as f:
-        json.dump(records, f, indent=4)
+        gray_image = ImageOps.grayscale(image)
+        gray_np = np.array(gray_image)
+        result = reader.readtext(gray_np, detail=0)
+        return "\n".join(result) if result else None
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text extraction failed: {str(e)}")
 
 
 # -------------------------------
-# API Endpoints
+# API Endpoint
 # -------------------------------
-class ImageURLRequest(BaseModel):
-    image_url: str
+@app.post("/analyze")
+async def analyze_image(
+    file: UploadFile = File(None),
+    image_url: str = Form(None)
+):
+    """
+    Analyze an image for text and DeepFake detection.
+    You can either upload an image file or provide an image URL.
+    """
+    print(image_url)
+    if not file and not image_url:
+        raise HTTPException(status_code=400, detail="Please provide either an uploaded image or an image URL.")
 
+    if file:
+        try:
+            contents = await file.read()
+            image = Image.open(BytesIO(contents)).convert("RGB")
+            source = file.filename
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image file.")
+    elif image_url:
+        if not validators.url(image_url):
+            raise HTTPException(status_code=400, detail="Invalid image URL.")
+        image = load_image_from_url(image_url)
+        source = image_url
+    else:
+        raise HTTPException(status_code=400, detail="No valid image source provided.")
+
+    extracted_text = extract_text_from_image(image)
+    classification = classify_image(image)
+
+    # ✅ Return result in your requested format
+    return JSONResponse(
+        content={
+            "source": source,
+            "verdict": classification["verdict"],
+            "confidence": round(classification["confidence"], 3),
+            "extracted_text": extracted_text or "No text detected.",
+        }
+    )
+
+
+# -------------------------------
+# Root Endpoint
+# -------------------------------
 @app.get("/")
-def read_root():
-  return {"message": "Welcome to the Image Text & DeepFake Detection API. Use /analyze/url or /analyze/upload endpoints."}
-
-@app.post("/analyze/url")
-async def analyze_image_url(payload: ImageURLRequest):
-    url = payload.image_url
-    print(url)
-    if not validators.url(url):
-        raise HTTPException(status_code=400, detail="Invalid image URL.")
-    try:
-        image = load_image_from_url(url)
-        extracted_text = extract_text_from_image(image)
-        verdict, confidence = classify_image(image)
-        record = {
-            "timestamp": datetime.now().isoformat(),
-            "image_source": url,
-            "extracted_text": extracted_text if extracted_text else "No text found",
-            "verdict": verdict,
-            "confidence": round(confidence, 3)
-        }
-        print(record)
-        save_result_to_json(record)
-        return JSONResponse(record)
-    except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/analyze/upload")
-async def analyze_uploaded_image(file: UploadFile = File(...)):
-    try:
-        image = Image.open(file.file).convert("RGB")
-        extracted_text = extract_text_from_image(image)
-        verdict, confidence = classify_image(image)
-        record = {
-            "timestamp": datetime.now().isoformat(),
-            "image_source": file.filename,
-            "extracted_text": extracted_text if extracted_text else "No text found",
-            "verdict": verdict,
-            "confidence": round(confidence, 3)
-        }
-        save_result_to_json(record)
-        return JSONResponse(record)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/history")
-def get_history():
-    if not os.path.exists(JSON_FILE):
-        return []
-    with open(JSON_FILE, "r") as f:
-        data = json.load(f)
-    return JSONResponse(data)
+def root():
+    return {
+        "message": "🧠 Welcome to the Image Text & DeepFake Detector API",
+        "usage": "Send POST request to /analyze with either 'file' or 'url'."
+    }
+    
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8080)
